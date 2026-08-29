@@ -1,0 +1,21 @@
+{
+  "name": "judgment",
+  "version": "0.1.0",
+  "description": "A rubric-driven judgment system: separates fuzzy assessment from auditable decision.",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test --experimental-strip-types test/*.test.ts",
+    "judge": "node --experimental-strip-types src/cli.ts",
+    "serve": "node --experimental-strip-types src/server.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.122.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
