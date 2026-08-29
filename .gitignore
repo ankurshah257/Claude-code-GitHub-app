@@ -1,14 +1,14 @@
-node_modules/
-dist/
-*.log
-.env
-.env.*
-!.env.example
-
-# Python scanner
 __pycache__/
 *.pyc
+*.pyo
+.venv/
+venv/
+
+# Scan output and cached corpus files
 *.db
 *.db-wal
 *.db-shm
 *.parquet
+
+*.log
+.env

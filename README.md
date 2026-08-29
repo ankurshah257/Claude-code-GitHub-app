@@ -1,182 +1,131 @@
-# judgment
+# Indian civil judgments scanner
 
-A system for judgment: it scores a subject against a rubric, then applies a
-fixed policy to turn those scores into a verdict. Ships with a GitHub App that
-judges pull requests, but the engine has no idea what a pull request is.
-
-## The one idea
-
-Most "AI reviewer" systems ask a model for a verdict. This one never does.
-
-```
-      model                          deterministic code
-  ┌─────────────┐                   ┌──────────────────┐
-  │  Assessment │ ── scores ──────► │      Policy      │ ──► Verdict
-  │ per criterion│  + confidence    │ weights, blocking│
-  │  + evidence  │                  │ thresholds, cover│
-  └─────────────┘                   └──────────────────┘
-     fallible                            auditable
-```
-
-The model scores individual criteria and reports how sure it is. Deterministic
-code decides what those scores add up to. That split buys three things:
-
-- **The verdict is reproducible.** Same assessments, same rubric, same verdict —
-  always. There is a test asserting exactly this.
-- **You can disagree with a score without the decision being a mystery.** The
-  rule that turned 57% into "changes requested" is readable code, not a vibe.
-- **A model cannot talk itself into a conclusion.** It never sees the thresholds,
-  so it cannot nudge a score to reach a verdict it prefers.
-
-## What makes a judgment trustworthy
-
-Scoring is the easy part. These are the parts that decide whether a verdict
-means anything:
-
-**Evidence or it doesn't count.** Every score must cite a checkable location in
-the subject. Scores that cite nothing are discarded, not counted. This is the
-single most effective guard against a model producing fluent, confident,
-entirely ungrounded findings.
-
-**Uncertainty is discarded, not averaged.** A score the judge isn't sure of is
-dropped rather than dragging the mean around. Crucially, an unreliable low score
-is *not allowed to block* — being unsure is not evidence against the subject.
-
-**Coverage is tracked and enforced.** If too much of the rubric got discarded,
-the system returns `ABSTAIN` instead of confidently judging on a fragment. A
-verdict over 40% of the rubric is worse than no verdict, because it looks the
-same as a real one.
-
-**Abstention is a real outcome.** `ABSTAIN` means "ask again", not a soft no. It
-is never a failure and never blocks.
-
-**A blocking criterion outranks a good average.** A change can be well-tested,
-clear, and well-scoped and still be one that must not merge. Correctness and
-security block on their own, so a strong average cannot bury a fatal flaw.
-
-**Disagreement lowers confidence.** With a `Panel` of several judges, the median
-score is reported with confidence *reduced by the spread*. A panel split between
-0 and 1 lands at zero confidence and gets discarded — so a coin flip abstains
-instead of being reported as 0.5.
-
-## Verdicts
-
-| Verdict | Meaning |
-| --- | --- |
-| `PASS` | Meets the standard; nothing found against it. |
-| `REVISE` | Falls short but is fixable. `blockedBy` names what to fix. |
-| `REJECT` | Falls short badly enough that revision is not the right frame. |
-| `ABSTAIN` | Not enough reliable signal to judge. Ask again. |
-
-## Try it without GitHub
+Scans every judgment of the **Bombay High Court** and the **Supreme Court of
+India**, classifies each as civil or criminal, and stores the civil ones in a
+queryable SQLite database.
 
 ```bash
-npm install
-npm test
+pip install -r requirements.txt
 
-export ANTHROPIC_API_KEY=...          # or: ant auth login
-git diff main... | npm run judge      # add --json for the full record
+python -m judgments scan bombay --from 2020 --to 2024
+python -m judgments scan supreme --from 2023 --to 2024
+python -m judgments stats
+python -m judgments civil --final --limit 20
+python -m judgments civil --csv > civil.csv
+python -m judgments review          # what the system refused to classify
 ```
 
-Exits non-zero on a blocking verdict, so it composes into a pre-push hook or a
-CI step. `ABSTAIN` exits zero — the system declining to say is not a failure.
+Scans resume: interrupt one and re-run it, and it picks up at the first
+partition it had not finished.
 
-## Defining a rubric
+## Where the data comes from
 
-A rubric is the actual work. Guidance is written in terms of what is *observable*,
-because a judge given abstract standards ("is this good code?") returns its
-priors rather than its reading.
+Not from scraping. `sci.gov.in`, `bombayhighcourt.nic.in`, and the eCourts
+portal are CAPTCHA-gated and hostile to enumeration. The same judgments are
+published as open datasets in two public S3 buckets, already extracted and
+partitioned:
 
-```ts
-import { defineRubric } from "./src/judgment/rubric.ts";
+| | Bucket | Size |
+|---|---|---|
+| High Courts | `indian-high-court-judgments` | ~804k judgments, 1963– |
+| Supreme Court | `indian-supreme-court-judgments` | ~43k judgments, 1950– |
 
-export const rubric = defineRubric({
-  id: "code-review",
-  version: "1.0.0",
-  preamble: "Judge the change as submitted, not the change you would have written.",
-  criteria: [
-    {
-      id: "correctness",
-      title: "The change does what it claims",
-      weight: 3,
-      blockBelow: 0.5,        // fails on its own, regardless of the average
-      guidance: `Cite the specific line and the input that breaks it. If you
-cannot name a concrete failing case, this is not a correctness finding.`,
-    },
-  ],
-  policy: { passAt: 0.75, rejectBelow: 0.3, minCoverage: 0.6 },
-});
-```
+Bombay is partition `court=27_1`, across seven benches: the Principal Seat
+(Original and Appellate Sides), Nagpur, Aurangabad, Goa, and Kolhapur.
 
-`defineRubric` validates at load time and throws on the mistakes that are
-otherwise invisible at runtime: duplicate criterion ids, all-zero weights,
-guidance-free criteria, thresholds that leave no band for `REVISE`.
+## How civil matters are identified
 
-Version your rubrics. The version is recorded in every judgment, so a verdict
-can always be traced back to the policy that produced it.
+The two courts publish completely different metadata, so they need different
+classifiers. Both produce a decision, a confidence, and the **evidence** it
+rests on, so any answer can be traced to the field that produced it.
 
-## Using the engine directly
+**Bombay High Court** — the export carries `judicial_section`, which is the
+court's own civil/criminal label. That is authoritative, so it is the primary
+signal; `case_type` corroborates it. No PDF is opened.
 
-```ts
-const judgment = await judge(subject, rubric, new AnthropicJudge());
-// judgment.verdict, .score, .coverage, .blockedBy, .criteria, .rationale
-```
+**Supreme Court** — the export carries no case type and no section, only a
+neutral citation (`2024 INSC 735`) and party names. Nothing in it says whether
+a matter is civil. So the judgment PDF is fetched and its head is read for the
+jurisdiction header (`CIVIL APPELLATE JURISDICTION`), falling back to the case
+designation (`Writ Petition (C) No. 432 of 2023`). This is much slower —
+`--index-only` builds the index without it.
 
-`Judge` is a one-method interface, so a static analyzer or a human panel
-implements it as readily as a model. `ScriptedJudge` returns assessments you
-hand it — useful for testing the decision layer, and for probing a rubric
-("what would it take to get a PASS here?") before trusting it on real subjects.
+### Four outcomes, not two
 
-## Running the GitHub App
+`CIVIL` and `CRIMINAL` are the settled answers. The other two carry the value:
 
-```bash
-cp .env.example .env    # fill in the four required values
-npm run serve
-```
+- **`UNKNOWN`** — no usable signal. The system declines rather than guessing.
+- **`DISPUTED`** — signals contradicted each other. Real: five Bombay bail
+  applications carry a *civil* judicial section, and bail is definitionally
+  criminal. Collapsing that to a verdict would hide a data error.
 
-Point the App's webhook at `POST /webhook` and subscribe to **Pull requests**.
-Required permissions: **Pull requests** read & write, **Contents** read.
+`civil` queries exclude both, so what you get is only what the system stands
+behind. `review` shows what was set aside. Being able to see the residue is the
+point — a scan that silently dropped it would look cleaner and be less
+trustworthy.
 
-Two deliberate defaults:
+## What the corpus will do to you
 
-- **It never submits APPROVE.** A passing judgment means "nothing was found
-  against this", which is not a human vouching for the change. An approval
-  carries institutional weight this system has not earned.
-- **REQUEST_CHANGES is opt-in** (`ALLOW_REQUEST_CHANGES=true`). Blocking a
-  contributor's PR on a model's reading is a real cost to them, so a repository
-  has to ask for it. The default posts a comment.
+Five traps, each of which produced a wrong answer here before it was fixed.
 
-Every review discloses what was discarded and which files were never read.
-A confident verdict over half the diff is the failure mode worth making visible.
+**`CRA` is not Criminal Appeal.** In the Bombay corpus every one of its 1,327
+CRA matters carries a civil section: there it means *Civil Revision
+Application*. Hardcoding the intuitive reading silently drops them all. This is
+why `case_type` only ever corroborates and never overrides.
+
+**The Original Side says `Original`, not `Civil`.** The Bombay Original Side
+exercises ordinary original civil jurisdiction — suits, commercial, arbitration,
+company, testamentary — but labels its section `Original`. Treating that as
+unrecognised left **31% of a real scan unclassified**; mapping it recovered
+64,812 civil judgments. Verified before trusting: across the 71 distinct case
+types under that value, none is a known criminal type, and Original Side benches
+carry no `Criminal` section at all.
+
+**`cnr` is a case id, not a document id.** A case averages ~3.4 orders. Keying
+on `cnr` collapses 112,594 documents to 32,848. The document key is
+`cnr + order_number`.
+
+**Most documents are not judgments.** In one bench-year, 95,121 of 112,594
+documents are interim orders and only 17,473 are final. Use `--final` when you
+mean judgments.
+
+**`(C)` means civil.** Supreme Court citations abbreviate the qualifier —
+`Writ Petition (C)`, `SLP (Crl)`. Matching only the full words drops a large
+share of SC writ petitions to `UNKNOWN`.
+
+A sixth, for anyone using the Legal Data Hunter index of the same corpus rather
+than S3: its `date` field is the **crawl** date, not the decision date. A 1992
+second appeal is dated 2026 there, which is what produces a `max_year` of 2917.
+This scanner reads `decision_date` from the Parquet metadata instead.
 
 ## Layout
 
 ```
-src/judgment/      the engine — knows nothing about GitHub or code review
-  types.ts         Assessment (fallible) vs. Verdict (computed)
-  policy.ts        the deterministic decision layer — pure, heavily tested
-  rubric.ts        rubric definition + load-time validation
-  judge.ts         Judge interface, prompt, output normalization
-  panel.ts         multi-judge; disagreement lowers confidence
-  providers/       AnthropicJudge (strict tool output), ScriptedJudge
-src/rubrics/       rubric definitions
-src/github/        webhook verification, PR → Subject, Judgment → review
-src/app.ts         the only place the engine and GitHub meet
+judgments/
+  taxonomy.py        case-type and section vocabulary, checked against the corpus
+  classify.py        the classifier — evidence, confidence, UNKNOWN, DISPUTED
+  sources/s3.py      anonymous S3 listing and fetch, paginated and retried
+  sources/bombay.py  Bombay adapter (Parquet metadata, no PDFs)
+  sources/supreme.py Supreme Court adapter (per-judgment PDF text)
+  store.py           SQLite, idempotent writes, resumable partitions
+  scan.py            the pipeline
+  cli.py             command line
+tests/               37 tests, no network
 ```
 
-The engine has no GitHub imports and the GitHub layer has no rubric imports, so
-either side can be replaced without touching the other.
+`python -m unittest discover -s tests`
 
-## Notes
+## Limits
 
-Model output is normalized before it reaches the policy layer — scores are
-clamped, non-finite values are treated as unusable, unknown criterion ids are
-dropped. Strict tool output guarantees the *shape*, not that the values are sane.
-
-Webhook signatures are verified against raw request bytes with a timing-safe
-compare, before any parsing. Verifying a re-serialized object is the classic way
-to make signature checking silently useless.
-
-The server acknowledges with `202` and judges afterwards, because GitHub retries
-deliveries it considers timed out and a judgment takes far longer than that
-budget. A crash mid-judgment loses that delivery; the next push re-triggers it.
+- **Bombay classification is only as good as `judicial_section`.** It is the
+  registry's own field, and the ~0.4% it leaves as UNKNOWN or DISPUTED is
+  reported rather than papered over.
+- **Supreme Court coverage is the reported corpus** (SCR/eSCR), not every order
+  the Court has passed.
+- **A full Supreme Court scan is slow**: one PDF fetch and parse per judgment,
+  ~43k judgments. Scoping by year is usually what you want.
+- **Scanned-image judgments have no text layer.** Older SC PDFs may extract
+  nothing; those surface as `UNKNOWN` rather than being guessed at. OCR is not
+  attempted.
+- **Nothing here is legal advice**, and a classification is a research filter,
+  not a determination. Verify against the official record before relying on it.
