@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 
 from .sources import bombay, supreme
@@ -205,9 +206,19 @@ def cmd_summarize(args: argparse.Namespace) -> None:
 
         index = pdf_locations(progress=say)
         reachable = [r for r in pending if r["uid"] in index]
-        n = len(reachable)
+        missing = len(pending) - len(reachable)
+
+        token = args.kanoon_token or os.environ.get("INDIANKANOON_TOKEN", "")
+        n = len(reachable) + (missing if token else 0)
+
         print(f"{len(pending):,} judgments lack a holding; "
-              f"{n:,} have a retrievable PDF ({len(pending)-n:,} have none).")
+              f"{len(reachable):,} have a PDF in the open corpus.")
+        if token:
+            print(f"{missing:,} will be looked up on Indian Kanoon "
+                  f"(their paid API bills ~2 calls each).")
+        elif missing:
+            print(f"{missing:,} have no open-corpus PDF. Pass --kanoon-token "
+                  f"(or set INDIANKANOON_TOKEN) to source those from Indian Kanoon.")
         if n == 0:
             print("Nothing can be summarised: no source documents available.")
             return
@@ -232,14 +243,18 @@ def cmd_summarize(args: argparse.Namespace) -> None:
 
         result = generate_holdings(
             store, limit=args.limit, effort=args.effort,
-            model=args.model, workers=args.workers, progress=say,
+            model=args.model, workers=args.workers,
+            kanoon_token=token, progress=say,
         )
         usage = result["usage"]
         print(
             f"\nSummarised {result['summarised']:,} | "
             f"decided nothing {result['no_holding']:,} | failed {result['failed']:,} | "
-            f"no PDF available {result.get('unavailable', 0):,}"
+            f"not found on Indian Kanoon {result.get('not_found', 0):,} | "
+            f"unreachable {result.get('unavailable', 0):,}"
         )
+        if result.get("kanoon_calls"):
+            print(f"Indian Kanoon API calls: {result['kanoon_calls']:,} (billed by them)")
         print(f"Actual cost: ${usage.cost(str(result['model'])):,.2f} "
               f"({usage.input_tokens:,} in / {usage.output_tokens:,} out)")
         for r in store.holding_breakdown():
@@ -316,6 +331,9 @@ def main(argv: list[str] | None = None) -> None:
                       choices=["low", "medium", "high", "xhigh", "max"])
     summ.add_argument("--model", help="default claude-opus-5")
     summ.add_argument("--workers", type=int, default=4)
+    summ.add_argument("--kanoon-token",
+                      help="Indian Kanoon API token, for judgments the open corpus lacks "
+                           "(else INDIANKANOON_TOKEN)")
     summ.add_argument("--estimate", action="store_true", help="price it, do not run")
     summ.add_argument("--yes", action="store_true", help="confirm a large run")
     summ.add_argument("--quiet", action="store_true")

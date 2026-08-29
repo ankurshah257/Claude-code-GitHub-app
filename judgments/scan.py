@@ -207,6 +207,7 @@ def generate_holdings(
     effort: str = "high",
     model: str | None = None,
     workers: int = 4,
+    kanoon_token: str | None = None,
     progress: Progress = _noop,
 ) -> dict[str, object]:
     """Read Bombay judgments and record a generated holding for each.
@@ -237,15 +238,18 @@ def generate_holdings(
     # the reachable set is found before any money is spent rather than by
     # paying for a fetch that turns out to have nothing to read.
     reachable = [r for r in pending if r["uid"] in index]
-    unavailable = len(pending) - len(reachable)
+    from_kanoon = [r for r in pending if r["uid"] not in index] if kanoon_token else []
+    unavailable = len(pending) - len(reachable) - len(from_kanoon)
     progress(
-        f"  {len(reachable):,} of {len(pending):,} have a retrievable judgment PDF"
-        f" ({unavailable:,} have none in the corpus)"
+        f"  {len(reachable):,} of {len(pending):,} have a judgment PDF in the open corpus"
+        + (f"; {len(from_kanoon):,} to be looked up on Indian Kanoon" if from_kanoon else "")
+        + (f"; {unavailable:,} unreachable" if unavailable else "")
     )
+    if not reachable and not from_kanoon:
+        return {"summarised": 0, "no_holding": 0, "failed": 0, "not_found": 0,
+                "unavailable": unavailable, "usage": Usage(), "model": model,
+                "kanoon_calls": 0}
     pending = reachable
-    if not pending:
-        return {"summarised": 0, "no_holding": 0, "failed": 0,
-                "unavailable": unavailable, "usage": Usage(), "model": model}
 
     summariser = Summariser(model=model, effort=effort)
     counts = {"summarised": 0, "no_holding": 0, "failed": 0}
@@ -284,7 +288,39 @@ def generate_holdings(
                     f"  {i}/{len(pending)} read, ${total.cost(model):.2f} spent so far"
                 )
 
-    return {**counts, "unavailable": unavailable, "usage": total, "model": model}
+    # Judgments the open corpus does not carry are looked up on Indian Kanoon.
+    # Sequential rather than pooled: this is someone else's paid API and a
+    # backfill is already a lot of requests to send them.
+    not_found = 0
+    kanoon_calls = 0
+    if from_kanoon:
+        from .sources import kanoon as ik
+
+        client = ik.KanoonClient(kanoon_token or "")
+        rows = ((r["uid"], r["name"], "Bombay High Court", r["date"]) for r in from_kanoon)
+        progress(f"  looking up {len(from_kanoon):,} judgments on Indian Kanoon...")
+
+        for j, (uid, text, match) in enumerate(ik.fetch_texts(client, rows), 1):
+            if not text:
+                not_found += 1
+            else:
+                try:
+                    result = summariser.summarise(text, title=match.hit.title if match.hit else "")
+                except Exception:  # noqa: BLE001
+                    counts["failed"] += 1
+                    continue
+                total = total + result.usage
+                store.set_holding(uid, result.holding.text, Provenance.GENERATED.value)
+                counts["summarised" if result.states_a_holding else "no_holding"] += 1
+            if j % 25 == 0:
+                progress(
+                    f"  {j}/{len(from_kanoon)} looked up "
+                    f"({client.calls.total} IK calls, ${total.cost(model):.2f} model spend)"
+                )
+        kanoon_calls = client.calls.total
+
+    return {**counts, "unavailable": unavailable, "not_found": not_found,
+            "kanoon_calls": kanoon_calls, "usage": total, "model": model}
 
 
 def pdf_locations(

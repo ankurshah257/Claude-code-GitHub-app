@@ -5,3 +5,4 @@ pyarrow>=15.0
 pypdf>=4.0
 # Generated holdings (summarize command) only
 anthropic>=1.2.0
+# Indian Kanoon source uses only the standard library (http.client)

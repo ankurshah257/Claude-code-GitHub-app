@@ -60,10 +60,40 @@ corpus does:
 Estimated cost: $83.20 (~$0.0325 each, model claude-opus-5)
 ```
 
-That 6% is a property of the source, not of this tool — sampled judgments
-missing from the 2026 partition are absent from 2023–2025 as well. The gap
-closes only if the courts publish more documents, or via a source that holds
-them (Indian Kanoon's paid API being the obvious candidate).
+That 6% is a property of the open corpus, not of this tool — sampled judgments
+missing from the 2026 partition are absent from 2023–2025 as well.
+
+### Filling the rest from Indian Kanoon
+
+The remaining 40,086 are sourced from Indian Kanoon's **official API**, which
+needs a token from https://api.indiankanoon.org and bills per call:
+
+```bash
+export INDIANKANOON_TOKEN=...
+python -m judgments summarize --estimate     # now reports full coverage
+python -m judgments summarize --yes
+```
+
+```
+42,646 judgments lack a holding; 2,560 have a PDF in the open corpus.
+40,086 will be looked up on Indian Kanoon (their paid API bills ~2 calls each).
+Estimated cost: $1,385.99   (model spend; Indian Kanoon bills separately)
+```
+
+This is their API, not their website. Scraping the site is what their terms
+prohibit; the API is the sanctioned route for bulk use. The request shape —
+`POST` with parameters in the query string, `Authorization: Token` — is taken
+from their own published client rather than inferred.
+
+**A match must agree on court, date and parties before it is used.** The search
+pins `fromdate` and `todate` to the decision date, which narrows candidates to
+what that court delivered that day; the court is then re-checked against the
+`docsource` the API returns rather than trusted from the `doctypes:` filter,
+and party names are compared after normalising away `M/s`, `Ors`, honorifics
+and case. A near-miss is recorded as not found: attaching the wrong judgment's
+holding to a row is worse than the empty cell it would replace. The document is
+only fetched once a match is confirmed, so a failed lookup costs one billed
+call instead of two.
 
 The run establishes what is reachable *before* spending anything, prices it
 from measured token usage, and refuses to start a run over 200 judgments
@@ -215,10 +245,15 @@ tests/               86 tests, no network
 - **Scanned-image judgments have no text layer.** Older SC PDFs may extract
   nothing; those surface as `UNKNOWN` rather than being guessed at. OCR is not
   attempted.
-- **Judgment PDFs exist for only ~6% of Bombay registry matters.** The
-  case-details export lists every matter the registry recorded; the document
-  corpus holds far fewer. This caps generated holdings and is not something the
-  scanner can work around.
+- **Judgment PDFs exist for only ~6% of Bombay registry matters** in the open
+  corpus. The case-details export lists every matter the registry recorded; the
+  document corpus holds far fewer. Indian Kanoon covers the rest, at their
+  per-call price.
+- **Indian Kanoon's court codes are unverified here.** `DOCTYPES` holds their
+  identifiers, which could not be confirmed against the live API from this
+  environment. They are overridable, and because every result is re-checked
+  against the returned court name, a wrong code yields no matches rather than
+  wrong judgments.
 - **Generated holdings are a reading, not a source.** They carry
   `held_source='generated'`, and should not be quoted as the court's words.
 - **Some `.pdf` objects are not PDFs.** A few hold the court site's own 404
