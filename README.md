@@ -38,10 +38,37 @@ Court publishes no headnotes**, so its rows carry no holding rather than a
 generated summary. Every row records which it is in `held_source`
 (`headnote` or `none`), so a quotation can never be mistaken for a paraphrase.
 
-Filling the gap would mean having a model read each judgment. That is a
-reading, not a source, and this system does not silently pass one off as the
-other; if you want it, it should be added as an explicit, separately labelled
-`generated` provenance.
+### Generated holdings, and the ceiling on them
+
+`summarize` fills the Bombay gap by having Claude read the judgment and write
+the holding the court did not publish. It is stored as
+`held_source='generated'` and never merged with headnote text — a headnote is
+citable, a reading is not.
+
+```bash
+python -m judgments summarize --estimate      # coverage and price, spends nothing
+python -m judgments summarize --limit 50      # try a batch
+python -m judgments summarize --yes           # the lot
+```
+
+**Most Bombay judgments cannot be summarised, because the judgment itself is
+not published.** The registry metadata covers far more matters than the PDF
+corpus does:
+
+```
+42,646 judgments lack a holding; 2,560 have a retrievable PDF (40,086 have none).
+Estimated cost: $83.20 (~$0.0325 each, model claude-opus-5)
+```
+
+That 6% is a property of the source, not of this tool — sampled judgments
+missing from the 2026 partition are absent from 2023–2025 as well. The gap
+closes only if the courts publish more documents, or via a source that holds
+them (Indian Kanoon's paid API being the obvious candidate).
+
+The run establishes what is reachable *before* spending anything, prices it
+from measured token usage, and refuses to start a run over 200 judgments
+without `--yes`. Procedural orders that decide nothing are recorded as such
+rather than given an invented holding.
 
 ## Full-corpus scanning
 
@@ -164,13 +191,14 @@ judgments/
   classify.py        the classifier — evidence, confidence, UNKNOWN, DISPUTED
   acts.py            statute canonicalisation for act-wise grouping
   holding.py         verbatim "Held:" and "List of Acts" from eSCR headnotes
+  summarize.py       generated holdings where no headnote exists, with costing
   sources/s3.py      anonymous S3 listing and fetch, paginated and retried
   sources/bombay.py  Bombay adapter (Parquet metadata, no PDFs)
   sources/supreme.py Supreme Court adapter (per-judgment PDF text)
   store.py           SQLite, idempotent writes, resumable partitions
   scan.py            the pipeline
   cli.py             command line
-tests/               68 tests, no network
+tests/               86 tests, no network
 ```
 
 `python -m unittest discover -s tests`
@@ -187,6 +215,15 @@ tests/               68 tests, no network
 - **Scanned-image judgments have no text layer.** Older SC PDFs may extract
   nothing; those surface as `UNKNOWN` rather than being guessed at. OCR is not
   attempted.
+- **Judgment PDFs exist for only ~6% of Bombay registry matters.** The
+  case-details export lists every matter the registry recorded; the document
+  corpus holds far fewer. This caps generated holdings and is not something the
+  scanner can work around.
+- **Generated holdings are a reading, not a source.** They carry
+  `held_source='generated'`, and should not be quoted as the court's words.
+- **Some `.pdf` objects are not PDFs.** A few hold the court site's own 404
+  page, saved by the crawler and served by S3 with a 200. They are detected by
+  magic bytes and skipped.
 - **Act coverage differs by court.** Bombay records statutes in a structured
   registry field. The Supreme Court has no such field, so its acts come from
   the headnote's `List of Acts` — present in reported judgments, absent if the

@@ -263,6 +263,34 @@ class Store:
             self._conn.commit()
         return len(updates)
 
+    def needing_holdings(self, court: str, limit: int | None = None) -> list[sqlite3.Row]:
+        """Digest rows for a court that have no holding yet.
+
+        Ordered newest-first so a capped run summarises the most recent
+        judgments, which are the ones a researcher is most likely to want.
+        """
+        sql = (
+            "SELECT uid, name, date FROM digest "
+            "WHERE court = ? AND held_source = 'none' ORDER BY date DESC"
+        )
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        return list(self._conn.execute(sql, (court,)))
+
+    def set_holding(self, uid: str, text: str, source: str) -> None:
+        """Attach a holding to a digest row."""
+        self._conn.execute(
+            "UPDATE digest SET held = ?, held_source = ? WHERE uid = ?",
+            (text, source, uid),
+        )
+        self._conn.commit()
+
+    def holding_breakdown(self) -> list[sqlite3.Row]:
+        return list(self._conn.execute(
+            "SELECT court, held_source, COUNT(*) n FROM digest "
+            "GROUP BY court, held_source ORDER BY court, held_source"
+        ))
+
     def digest_uids(self) -> set[str]:
         """Ids already in the digest.
 

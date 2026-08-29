@@ -289,3 +289,69 @@ def scan_cases(bench: str, since: str | None = None) -> Iterator[Judgment]:
             holding=Holding("", Provenance.NONE),
             extra={"judicial_section": _text(record.get("judicial_section"))},
         )
+
+
+# --------------------------------------------------------------------------
+# Locating judgment PDFs
+#
+# The case-details export names no PDF. The objects themselves are keyed
+# <CNR>_<order>_<decision date>.pdf, but the year= partition they sit under is
+# the *crawl* year, not the decision year -- a 2006 judgment appears under
+# year=2026 -- so a key cannot be computed from a case record. It has to be
+# looked up, which means listing the partition once and indexing it.
+# --------------------------------------------------------------------------
+
+
+def pdf_index(bench: str, crawl_years: list[str]) -> dict[str, list[str]]:
+    """Map CNR to its PDF object keys, newest order last.
+
+    Listing is the expensive part (roughly a request per thousand objects), so
+    the caller builds this once per bench and reuses it across every judgment.
+    """
+    index: dict[str, list[str]] = {}
+    for year in crawl_years:
+        prefix = f"data/pdf/year={year}/court={BOMBAY_COURT_CODE}/bench={bench}/"
+        for obj in s3.list_objects(s3.HIGH_COURT_BUCKET, prefix):
+            if isinstance(obj, str) or not obj.key.endswith(".pdf"):
+                continue
+            name = obj.key.rsplit("/", 1)[-1]
+            cnr = name.split("_", 1)[0]
+            index.setdefault(cnr, []).append(obj.key)
+
+    # The last order of a case is the one that disposes of it, which is the
+    # document a holding should come from.
+    for keys in index.values():
+        keys.sort()
+    return index
+
+
+class NotAPdf(RuntimeError):
+    """The stored object is not a PDF.
+
+    Some ``.pdf`` keys in this bucket hold the court site's own 404 page,
+    saved by the crawler when the source link was already dead. They are a
+    couple of hundred bytes of HTML and S3 serves them with a 200, so nothing
+    upstream flags them -- only the magic bytes distinguish them from a real
+    judgment.
+    """
+
+
+def judgment_text(key: str, max_pages: int = 25) -> str:
+    """Fetch a Bombay judgment PDF and extract its text.
+
+    These have a real text layer, but the extraction is often character-spaced
+    ("IN T H E HIG H CO U R T"), which downstream consumers must tolerate.
+    """
+    from pypdf import PdfReader
+
+    blob = s3.fetch(s3.HIGH_COURT_BUCKET, key)
+    if not blob.startswith(b"%PDF-"):
+        raise NotAPdf(f"{key} is not a PDF ({len(blob)} bytes)")
+    reader = PdfReader(io.BytesIO(blob))
+    parts = []
+    for page in reader.pages[:max_pages]:
+        try:
+            parts.append(page.extract_text() or "")
+        except Exception:  # noqa: BLE001
+            continue
+    return "\n".join(parts)

@@ -193,3 +193,114 @@ def build_digest(
         progress(f"  consolidated {merged} year-less act entries")
 
     return added
+
+
+# --------------------------------------------------------------------------
+# Generating holdings for the court that publishes none
+# --------------------------------------------------------------------------
+
+
+def generate_holdings(
+    store: Store,
+    *,
+    limit: int | None = None,
+    effort: str = "high",
+    model: str | None = None,
+    workers: int = 4,
+    progress: Progress = _noop,
+) -> dict[str, object]:
+    """Read Bombay judgments and record a generated holding for each.
+
+    Resumable by construction: only rows still lacking a holding are selected,
+    so an interrupted run costs nothing to repeat and a weekly run only pays
+    for that week's new judgments.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from .holding import Provenance
+    from .sources import bombay
+    from .summarize import Summariser, Usage
+
+    if not model:
+        from .summarize import DEFAULT_MODEL
+
+        model = DEFAULT_MODEL
+
+    pending = store.needing_holdings("Bombay High Court", limit=limit)
+    if not pending:
+        return {"summarised": 0, "no_holding": 0, "failed": 0, "unavailable": 0,
+                "usage": Usage(), "model": model}
+
+    index = pdf_locations(progress=progress)
+
+    # Most registry matters have no judgment document in the open corpus, so
+    # the reachable set is found before any money is spent rather than by
+    # paying for a fetch that turns out to have nothing to read.
+    reachable = [r for r in pending if r["uid"] in index]
+    unavailable = len(pending) - len(reachable)
+    progress(
+        f"  {len(reachable):,} of {len(pending):,} have a retrievable judgment PDF"
+        f" ({unavailable:,} have none in the corpus)"
+    )
+    pending = reachable
+    if not pending:
+        return {"summarised": 0, "no_holding": 0, "failed": 0,
+                "unavailable": unavailable, "usage": Usage(), "model": model}
+
+    summariser = Summariser(model=model, effort=effort)
+    counts = {"summarised": 0, "no_holding": 0, "failed": 0}
+    total = Usage()
+
+    def work(row: object) -> tuple[str, object, object, str]:
+        uid, name = row["uid"], row["name"]
+        keys = index[uid]
+        try:
+            text = bombay.judgment_text(keys[-1])
+        except Exception as err:  # noqa: BLE001
+            return uid, None, Usage(), f"unreadable: {err}"
+        try:
+            result = summariser.summarise(text, title=name)
+        except Exception as err:  # noqa: BLE001
+            return uid, None, Usage(), f"summarise failed: {err}"
+        return uid, result, result.usage, ""
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for i, (uid, result, usage, error) in enumerate(pool.map(work, pending), 1):
+            total = total + usage
+            if error or result is None:
+                counts["failed"] += 1
+            elif not result.states_a_holding:
+                # Recorded, not discarded: "this order decides nothing" is a
+                # useful answer, and storing it stops the next run re-reading
+                # the same document to reach it again.
+                store.set_holding(uid, result.holding.text, Provenance.GENERATED.value)
+                counts["no_holding"] += 1
+            else:
+                store.set_holding(uid, result.holding.text, Provenance.GENERATED.value)
+                counts["summarised"] += 1
+
+            if i % 25 == 0:
+                progress(
+                    f"  {i}/{len(pending)} read, ${total.cost(model):.2f} spent so far"
+                )
+
+    return {**counts, "unavailable": unavailable, "usage": total, "model": model}
+
+
+def pdf_locations(
+    years: tuple[str, ...] = ("2026",), progress: Progress = _noop
+) -> dict[str, list[str]]:
+    """Index every Bombay judgment PDF available for the given decision years.
+
+    Listing costs roughly one request per thousand objects, so this is built
+    once and shared across a whole run.
+    """
+    from .sources import bombay
+
+    progress("  indexing available judgment PDFs...")
+    index: dict[str, list[str]] = {}
+    for bench in bombay.case_detail_benches():
+        for cnr, keys in bombay.pdf_index(bench, list(years)).items():
+            index.setdefault(cnr, []).extend(keys)
+    progress(f"  {len(index):,} judgments have a PDF in the corpus")
+    return index

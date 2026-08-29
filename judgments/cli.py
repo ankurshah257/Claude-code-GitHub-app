@@ -179,6 +179,73 @@ def cmd_acts(args: argparse.Namespace) -> None:
             print()
 
 
+#: Judgments above which a run must be confirmed with --yes. A full backfill
+#: costs over a thousand dollars, which is not something a mistyped command
+#: should be able to start.
+CONFIRM_ABOVE = 200
+
+
+def cmd_summarize(args: argparse.Namespace) -> None:
+    """Generate holdings for Bombay judgments, which have no headnotes."""
+    from .scan import generate_holdings
+    from .summarize import Usage, credentials_available
+
+    say = (lambda m: None) if args.quiet else (lambda m: print(m, flush=True))
+
+    with Store(args.db) as store:
+        pending = store.needing_holdings("Bombay High Court", limit=args.limit)
+        if not pending:
+            print("Every Bombay judgment in the digest already has a holding.")
+            return
+
+        # Only judgments whose PDF is actually in the corpus can be read, and
+        # that is a small fraction. Establishing it first keeps the estimate
+        # honest instead of quoting a price for work that cannot happen.
+        from .scan import pdf_locations
+
+        index = pdf_locations(progress=say)
+        reachable = [r for r in pending if r["uid"] in index]
+        n = len(reachable)
+        print(f"{len(pending):,} judgments lack a holding; "
+              f"{n:,} have a retrievable PDF ({len(pending)-n:,} have none).")
+        if n == 0:
+            print("Nothing can be summarised: no source documents available.")
+            return
+
+        # Priced from a measured average: ~5k input and ~300 output tokens on a
+        # 35 KB judgment. Real cost is reported from actual usage afterwards.
+        estimate = Usage(5000 * n, 300 * n, 0).cost()
+        print(f"Estimated cost: ${estimate:,.2f} (~${estimate/n:.4f} each, model {args.model or 'claude-opus-5'})")
+
+        if args.estimate:
+            return
+        if n > CONFIRM_ABOVE and not args.yes:
+            sys.exit(
+                f"\nThis run would summarise {n:,} judgments and spend real money.\n"
+                f"Re-run with --yes to proceed, or --limit N to do fewer first."
+            )
+        if not credentials_available():
+            sys.exit(
+                "No Anthropic credentials found. Set ANTHROPIC_API_KEY, or run "
+                "`ant auth login`."
+            )
+
+        result = generate_holdings(
+            store, limit=args.limit, effort=args.effort,
+            model=args.model, workers=args.workers, progress=say,
+        )
+        usage = result["usage"]
+        print(
+            f"\nSummarised {result['summarised']:,} | "
+            f"decided nothing {result['no_holding']:,} | failed {result['failed']:,} | "
+            f"no PDF available {result.get('unavailable', 0):,}"
+        )
+        print(f"Actual cost: ${usage.cost(str(result['model'])):,.2f} "
+              f"({usage.input_tokens:,} in / {usage.output_tokens:,} out)")
+        for r in store.holding_breakdown():
+            print(f"  {r['court']:26s} {r['held_source']:10s} {r['n']:,}")
+
+
 def cmd_review(args: argparse.Namespace) -> None:
     """Show what the system refused to classify."""
     with Store(args.db) as store:
@@ -239,6 +306,20 @@ def main(argv: list[str] | None = None) -> None:
     acts.add_argument("--exact", action="store_true", help="take the first match")
     acts.add_argument("--limit", type=int, default=40)
     acts.set_defaults(func=cmd_acts)
+
+    summ = sub.add_parser(
+        "summarize",
+        help="generate holdings for Bombay judgments (costs money; see --estimate)",
+    )
+    summ.add_argument("--limit", type=int, help="only this many, newest first")
+    summ.add_argument("--effort", default="high",
+                      choices=["low", "medium", "high", "xhigh", "max"])
+    summ.add_argument("--model", help="default claude-opus-5")
+    summ.add_argument("--workers", type=int, default=4)
+    summ.add_argument("--estimate", action="store_true", help="price it, do not run")
+    summ.add_argument("--yes", action="store_true", help="confirm a large run")
+    summ.add_argument("--quiet", action="store_true")
+    summ.set_defaults(func=cmd_summarize)
 
     review = sub.add_parser("review", help="show judgments the system declined to classify")
     review.add_argument("--limit", type=int, default=50)
