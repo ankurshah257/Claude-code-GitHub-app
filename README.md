@@ -25,10 +25,35 @@ judgments  act
     1,882  Arbitration and Conciliation Act, 1996
 ```
 
-`.github/workflows/weekly-digest.yml` runs `digest` every Monday. Re-running is
-cheap and idempotent: the source exports gain rows as judgments are published,
-so the job re-reads them and upserts on judgment id, and Supreme Court PDFs
-already digested are never fetched twice.
+### Running it weekly
+
+`.github/workflows/weekly-digest.yml` refreshes the digest every Monday and
+generates holdings for what is new. Re-running is cheap and idempotent: source
+exports gain rows as judgments are published, so the job re-reads and upserts on
+judgment id, and documents already read are never fetched twice.
+
+Add two repository secrets:
+
+| Secret | Used for |
+|---|---|
+| `ANTHROPIC_API_KEY` | generating holdings — without it the job still builds the digest and skips summarising |
+| `INDIANKANOON_TOKEN` | judgments missing from the open corpus |
+
+Two rules keep an unattended job from spending unexpectedly:
+
+- **A scheduled run is capped** at `SCHEDULED_LIMIT` (500, about $16 a week),
+  which keeps pace with new judgments. The 40k backfill costs over a thousand
+  dollars and a cron cannot start it — run it by hand via *Run workflow* with an
+  explicit `summarize_limit`.
+- **A scheduled run never bills Indian Kanoon.** Their lookup is opt-in per run
+  (`use_kanoon`), so the weekly job stays on the free corpus unless you ask.
+
+**Holdings are committed to `data/holdings.csv`.** The digest can be rebuilt
+from the open corpus for nothing, but holdings cannot — so they are restored
+into the database *before* each summarise step. A cache eviction then costs
+rebuild time instead of silently re-buying work already paid for. The file is
+plain text sorted by id, so git delta-compresses it and a weekly run adds
+kilobytes.
 
 ### What "held" means, and when it is missing
 

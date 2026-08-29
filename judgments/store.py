@@ -291,6 +291,40 @@ class Store:
             "GROUP BY court, held_source ORDER BY court, held_source"
         ))
 
+    def export_holdings(self) -> list[tuple[str, str, str]]:
+        """Every holding, for persisting outside the database.
+
+        The digest can be rebuilt from the open corpus for nothing; holdings
+        cost money to produce and must survive losing the database file. This
+        is the part worth keeping.
+        """
+        return [
+            (r["uid"], r["held"] or "", r["held_source"])
+            for r in self._conn.execute(
+                "SELECT uid, held, held_source FROM digest "
+                "WHERE held_source != 'none' ORDER BY uid"
+            )
+        ]
+
+    def import_holdings(self, rows: Iterable[tuple[str, str, str]]) -> int:
+        """Restore previously generated holdings onto a rebuilt digest.
+
+        Only fills rows that have none, so a restore can never overwrite a
+        holding with an older version of itself.
+        """
+        pairs = [(h, src, uid) for uid, h, src in rows if h]
+        if not pairs:
+            return 0
+        with closing(self._conn.cursor()) as cur:
+            cur.executemany(
+                "UPDATE digest SET held = ?, held_source = ? "
+                "WHERE uid = ? AND held_source = 'none'",
+                pairs,
+            )
+            written = cur.rowcount
+        self._conn.commit()
+        return max(written, 0)
+
     def digest_uids(self) -> set[str]:
         """Ids already in the digest.
 

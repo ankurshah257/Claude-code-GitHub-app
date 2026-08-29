@@ -203,5 +203,58 @@ class TestDigest(unittest.TestCase):
             self.assertEqual(len(s.act_index(since="2020-01-01")), 1)
             self.assertEqual(len(s.act_index(since="2030-01-01")), 0)
 
+
+class TestHoldingsPersistence(unittest.TestCase):
+    """Holdings must outlive the database: they cost money, the digest does not."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "p.db"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def _seed(self, store):
+        from dataclasses import replace
+        from judgments.acts import canonical
+        from judgments.holding import Holding, Provenance
+        j = make("a:1")
+        store.add_digest([replace(
+            j, acts=[canonical("Companies Act 2013")],
+            holding=Holding("The appeal is allowed.", Provenance.GENERATED),
+        )])
+
+    def test_round_trip_restores_a_lost_holding(self):
+        with Store(self.path) as s:
+            self._seed(s)
+            exported = s.export_holdings()
+            # Simulate the digest being rebuilt from scratch.
+            s._conn.execute("UPDATE digest SET held='', held_source='none'")
+            s._conn.commit()
+            self.assertEqual(s.digest_counts()["with_holding"], 0)
+            self.assertEqual(s.import_holdings(exported), 1)
+            row = s.by_act("companies act|2013")[0]
+            self.assertEqual(row["held"], "The appeal is allowed.")
+            self.assertEqual(row["held_source"], "generated")
+
+    def test_export_skips_rows_without_a_holding(self):
+        with Store(self.path) as s:
+            self._seed(s)
+            s.add_digest([make("b:1")])          # no holding
+            self.assertEqual([r[0] for r in s.export_holdings()], ["a:1"])
+
+    def test_import_never_overwrites_an_existing_holding(self):
+        # A restore must not clobber a newer holding with a stale one.
+        with Store(self.path) as s:
+            self._seed(s)
+            s.import_holdings([("a:1", "STALE", "generated")])
+            self.assertEqual(s.by_act("companies act|2013")[0]["held"],
+                             "The appeal is allowed.")
+
+    def test_import_of_nothing_is_harmless(self):
+        with Store(self.path) as s:
+            self._seed(s)
+            self.assertEqual(s.import_holdings([]), 0)
+
 if __name__ == "__main__":
     unittest.main()

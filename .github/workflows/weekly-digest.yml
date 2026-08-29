@@ -1,9 +1,17 @@
-# Weekly refresh of the act-wise civil judgments digest.
+# Weekly refresh of the act-wise civil judgments digest, and generation of
+# holdings for the judgments that have none.
 #
-# The run is incremental and idempotent: it re-reads the source exports (which
-# gain rows as judgments are published) and upserts on judgment id, so a repeat
-# run costs little and never duplicates. Supreme Court PDFs already digested
-# are not fetched again.
+# Two cost rules shape this file, because the summarise step spends real money
+# unattended:
+#
+#   1. A scheduled run is capped (SCHEDULED_LIMIT). The weekly delta is a few
+#      hundred judgments; the 40k backfill costs over a thousand dollars and is
+#      deliberately not something a cron can start on its own. Run it by hand
+#      with workflow_dispatch and an explicit limit.
+#   2. Holdings are committed to the repository as CSV. The digest is free to
+#      rebuild from the open corpus, but holdings are not, so they must survive
+#      a cache eviction — otherwise a cache miss silently re-buys work already
+#      paid for.
 name: Weekly judgments digest
 
 on:
@@ -15,12 +23,24 @@ on:
       since:
         description: "ISO start date"
         default: "2026-01-01"
+      summarize_limit:
+        description: "Max judgments to summarise this run (0 = skip summarising)"
+        default: "500"
+      use_kanoon:
+        description: "Also source judgments missing from the open corpus from Indian Kanoon"
+        type: boolean
+        default: false
+
+env:
+  # Weekly ceiling for a scheduled run. At ~$0.0325 a judgment this is about
+  # $16 a week, which keeps pace with new judgments without ever surprising
+  # anyone with a large bill.
+  SCHEDULED_LIMIT: "500"
 
 jobs:
   digest:
     runs-on: ubuntu-latest
-    # A cold first run reads the whole 2026 corpus; later runs are far quicker.
-    timeout-minutes: 120
+    timeout-minutes: 350
     permissions:
       contents: write
 
@@ -34,9 +54,9 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # Restore last week's database so the run is incremental rather than
-      # rebuilding from scratch every time.
-      - name: Restore previous digest
+      # Speeds a run up when it hits, but is never relied on: everything
+      # expensive is restored from the committed CSV below.
+      - name: Restore cached database
         uses: actions/cache@v4
         with:
           path: judgments.db
@@ -44,14 +64,60 @@ jobs:
           restore-keys: judgments-db-
 
       - name: Refresh digest
-        run: |
-          python -m judgments digest --since "${{ inputs.since || '2026-01-01' }}"
+        run: python -m judgments digest --since "${{ inputs.since || '2026-01-01' }}"
 
-      - name: Export act-wise snapshot
+      # Before summarising anything: put back every holding already paid for,
+      # so a lost or evicted database costs rebuild time and not money.
+      - name: Restore previously generated holdings
+        run: python -m judgments import-holdings data/holdings.csv
+
+      - name: Decide this run's budget
+        id: budget
+        env:
+          HAS_ANTHROPIC: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          HAS_KANOON: ${{ secrets.INDIANKANOON_TOKEN != '' }}
         run: |
-          mkdir -p export
+          LIMIT="${{ inputs.summarize_limit || env.SCHEDULED_LIMIT }}"
+          if [ "$HAS_ANTHROPIC" != "true" ]; then
+            echo "No ANTHROPIC_API_KEY secret; skipping summarisation."
+            LIMIT=0
+          fi
+          echo "limit=$LIMIT" >> "$GITHUB_OUTPUT"
+          echo "kanoon=$HAS_KANOON" >> "$GITHUB_OUTPUT"
+
+      - name: Generate holdings
+        if: steps.budget.outputs.limit != '0'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Only passed when the run asked for it. Without it, judgments absent
+          # from the open corpus are left alone rather than billed to Indian
+          # Kanoon by default.
+          INDIANKANOON_TOKEN: ${{ (inputs.use_kanoon && secrets.INDIANKANOON_TOKEN) || '' }}
+        run: |
+          python -m judgments summarize \
+            --limit "${{ steps.budget.outputs.limit }}" \
+            --yes
+
+      - name: Export holdings
+        run: |
+          mkdir -p data export
+          python -m judgments export-holdings data/holdings.csv
           python -m judgments acts --limit 100000 > export/acts-index.txt
           python -m judgments stats >> export/acts-index.txt
+
+      # Committed as plain text, sorted by id: git delta-compresses it well, so
+      # after the first commit a weekly run adds kilobytes rather than megabytes.
+      - name: Commit holdings
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/holdings.csv
+          if git diff --staged --quiet; then
+            echo "No new holdings this run."
+          else
+            git commit -m "Update generated holdings ($(date -u +%Y-%m-%d))"
+            git push
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

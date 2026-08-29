@@ -261,6 +261,30 @@ def cmd_summarize(args: argparse.Namespace) -> None:
             print(f"  {r['court']:26s} {r['held_source']:10s} {r['n']:,}")
 
 
+def cmd_export_holdings(args: argparse.Namespace) -> None:
+    """Write holdings to CSV so they outlive the database file."""
+    with Store(args.db) as store:
+        rows = store.export_holdings()
+    with open(args.path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["uid", "held", "held_source"])
+        w.writerows(rows)
+    print(f"Wrote {len(rows):,} holdings to {args.path}")
+
+
+def cmd_import_holdings(args: argparse.Namespace) -> None:
+    """Restore holdings onto a rebuilt digest, so none are paid for twice."""
+    if not os.path.exists(args.path):
+        print(f"{args.path} does not exist; nothing to restore.")
+        return
+    with open(args.path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        rows = [(r["uid"], r["held"], r["held_source"]) for r in reader]
+    with Store(args.db) as store:
+        n = store.import_holdings(rows)
+    print(f"Restored {n:,} holdings from {args.path} ({len(rows):,} in file)")
+
+
 def cmd_review(args: argparse.Namespace) -> None:
     """Show what the system refused to classify."""
     with Store(args.db) as store:
@@ -338,6 +362,14 @@ def main(argv: list[str] | None = None) -> None:
     summ.add_argument("--yes", action="store_true", help="confirm a large run")
     summ.add_argument("--quiet", action="store_true")
     summ.set_defaults(func=cmd_summarize)
+
+    exp = sub.add_parser("export-holdings", help="write holdings to CSV")
+    exp.add_argument("path", nargs="?", default="data/holdings.csv")
+    exp.set_defaults(func=cmd_export_holdings)
+
+    imp = sub.add_parser("import-holdings", help="restore holdings from CSV")
+    imp.add_argument("path", nargs="?", default="data/holdings.csv")
+    imp.set_defaults(func=cmd_import_holdings)
 
     review = sub.add_parser("review", help="show judgments the system declined to classify")
     review.add_argument("--limit", type=int, default=50)
