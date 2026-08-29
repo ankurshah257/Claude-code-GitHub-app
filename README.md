@@ -4,9 +4,48 @@ Scans every judgment of the **Bombay High Court** and the **Supreme Court of
 India**, classifies each as civil or criminal, and stores the civil ones in a
 queryable SQLite database.
 
+## The act-wise civil digest
+
+The headline output. One row per civil judgment — **the name, the court, the
+date, and what was held** — indexed by the Act it turns on, from 1 January 2026.
+
 ```bash
 pip install -r requirements.txt
 
+python -m judgments digest --since 2026-01-01   # build / refresh (the weekly job)
+python -m judgments acts                        # act-wise index
+python -m judgments acts --act "Arbitration and Conciliation"
+```
+
+```
+judgments  act
+   11,593  Code of Civil Procedure, 1908
+    8,721  Constitution of India
+    4,088  Indian Succession Act, 1925
+    1,882  Arbitration and Conciliation Act, 1996
+```
+
+`.github/workflows/weekly-digest.yml` runs `digest` every Monday. Re-running is
+cheap and idempotent: the source exports gain rows as judgments are published,
+so the job re-reads them and upserts on judgment id, and Supreme Court PDFs
+already digested are never fetched twice.
+
+### What "held" means, and when it is missing
+
+For the **Supreme Court** the holding is quoted **verbatim from the official
+eSCR headnote** — the Court's own words, citable as such. The **Bombay High
+Court publishes no headnotes**, so its rows carry no holding rather than a
+generated summary. Every row records which it is in `held_source`
+(`headnote` or `none`), so a quotation can never be mistaken for a paraphrase.
+
+Filling the gap would mean having a model read each judgment. That is a
+reading, not a source, and this system does not silently pass one off as the
+other; if you want it, it should be added as an explicit, separately labelled
+`generated` provenance.
+
+## Full-corpus scanning
+
+```bash
 python -m judgments scan bombay --from 2020 --to 2024
 python -m judgments scan supreme --from 2023 --to 2024
 python -m judgments stats
@@ -66,7 +105,7 @@ trustworthy.
 
 ## What the corpus will do to you
 
-Five traps, each of which produced a wrong answer here before it was fixed.
+Eight traps, each of which produced a wrong answer here before it was fixed.
 
 **`CRA` is not Criminal Appeal.** In the Bombay corpus every one of its 1,327
 CRA matters carries a civil section: there it means *Civil Revision
@@ -93,7 +132,26 @@ mean judgments.
 `Writ Petition (C)`, `SLP (Crl)`. Matching only the full words drops a large
 share of SC writ petitions to `UNKNOWN`.
 
-A sixth, for anyone using the Legal Data Hunter index of the same corpus rather
+**A statute's year is part of its identity.** Normalising act names by
+stripping the year merges `Companies Act 1956` with `Companies Act 2013`, and
+`Arbitration Act 1940` with the 1996 Act that repealed it — pooling judgments
+decided under repealed law with current law. Rendering is normalised; the year
+is not. A year-less variant is merged only where the corpus offers exactly one
+candidate, so `Indian Succession Act` resolves to 1925 while `Companies Act`
+stays separate. That merge has to run over the finished index, not per record:
+done per record it left the Code of Civil Procedure split into two entries of
+7,883 and 3,789 judgments.
+
+**The two courts date things differently.** The High Court writes
+`YYYY-MM-DD`, the Supreme Court `DD-MM-YYYY`. Comparing them as strings without
+normalising drops every Supreme Court judgment from a date window. Dates are
+normalised at the source so one column never holds both.
+
+**Some judgments are dated in the future.** A registry data-entry error, small
+in number, but it puts judgments that have not happened at the top of every
+date-sorted list. They are rejected on ingest.
+
+A further one, for anyone using the Legal Data Hunter index of the same corpus rather
 than S3: its `date` field is the **crawl** date, not the decision date. A 1992
 second appeal is dated 2026 there, which is what produces a `max_year` of 2917.
 This scanner reads `decision_date` from the Parquet metadata instead.
@@ -104,13 +162,15 @@ This scanner reads `decision_date` from the Parquet metadata instead.
 judgments/
   taxonomy.py        case-type and section vocabulary, checked against the corpus
   classify.py        the classifier — evidence, confidence, UNKNOWN, DISPUTED
+  acts.py            statute canonicalisation for act-wise grouping
+  holding.py         verbatim "Held:" and "List of Acts" from eSCR headnotes
   sources/s3.py      anonymous S3 listing and fetch, paginated and retried
   sources/bombay.py  Bombay adapter (Parquet metadata, no PDFs)
   sources/supreme.py Supreme Court adapter (per-judgment PDF text)
   store.py           SQLite, idempotent writes, resumable partitions
   scan.py            the pipeline
   cli.py             command line
-tests/               37 tests, no network
+tests/               68 tests, no network
 ```
 
 `python -m unittest discover -s tests`
@@ -127,5 +187,16 @@ tests/               37 tests, no network
 - **Scanned-image judgments have no text layer.** Older SC PDFs may extract
   nothing; those surface as `UNKNOWN` rather than being guessed at. OCR is not
   attempted.
+- **Act coverage differs by court.** Bombay records statutes in a structured
+  registry field. The Supreme Court has no such field, so its acts come from
+  the headnote's `List of Acts` — present in reported judgments, absent if the
+  headnote is missing.
+- **Roughly 860 distinct acts** survive canonicalisation from about a thousand
+  raw spellings per bench. Registry entries such as `Other Act` are kept as
+  recorded rather than being reinterpreted.
+- **Indian Kanoon is deliberately not used.** It is a private aggregator whose
+  terms do not permit bulk scraping, and it sells an API for that purpose. The
+  judgments here come from the courts' own open-data mirrors, where Indian
+  court judgments are public records under §52(1)(q) of the Copyright Act.
 - **Nothing here is legal advice**, and a classification is a research filter,
   not a determination. Verify against the official record before relying on it.

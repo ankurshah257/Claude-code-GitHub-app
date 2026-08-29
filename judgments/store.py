@@ -52,6 +52,38 @@ CREATE INDEX IF NOT EXISTS idx_court_year ON judgments(court, year);
 CREATE INDEX IF NOT EXISTS idx_date ON judgments(decision_date);
 CREATE INDEX IF NOT EXISTS idx_case ON judgments(case_id);
 
+-- The database the digest actually exposes: exactly what was asked for -- the
+-- name of the judgment, the court that passed it, the date of passing, and
+-- what was held. Kept separate from the scan table above so that the answer to
+-- "what is in the database" is a short, readable schema rather than a
+-- thirty-column scan record.
+CREATE TABLE IF NOT EXISTS digest (
+    uid        TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,   -- cause title, e.g. "A v. B"
+    court      TEXT NOT NULL,   -- the court that passed it
+    date       TEXT NOT NULL,   -- date of passing (ISO)
+    held       TEXT,            -- what is held
+    -- Provenance of `held`: "headnote" is the court's own words and is
+    -- citable; "none" means no headnote exists for this court. Recorded so a
+    -- quotation is never mistaken for a summary.
+    held_source TEXT NOT NULL DEFAULT 'none'
+);
+
+CREATE INDEX IF NOT EXISTS idx_digest_date ON digest(date);
+CREATE INDEX IF NOT EXISTS idx_digest_court ON digest(court);
+
+-- Act-wise index. Many-to-many: a judgment may turn on several statutes, and
+-- the same statute is applied across many judgments.
+CREATE TABLE IF NOT EXISTS digest_acts (
+    uid       TEXT NOT NULL,
+    act_key   TEXT NOT NULL,    -- canonical "name|year", the grouping key
+    act_label TEXT NOT NULL,    -- display form
+    section   TEXT,
+    PRIMARY KEY (uid, act_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_acts_key ON digest_acts(act_key);
+
 -- One row per completed partition, so an interrupted scan resumes instead of
 -- re-downloading everything it already processed.
 CREATE TABLE IF NOT EXISTS partitions (
@@ -151,6 +183,136 @@ class Store:
             )
         self._conn.commit()
         return len(rows)
+
+    def add_digest(self, judgments: Iterable[Judgment]) -> int:
+        """Record civil judgments in the digest and index them by act.
+
+        Only settled-civil judgments are admitted. DISPUTED and UNKNOWN are the
+        scan's business, not the digest's: this table is meant to be relied on.
+        """
+        rows = []
+        act_rows = []
+        for j in judgments:
+            if not j.classification.is_civil:
+                continue
+            rows.append(
+                (j.uid, j.title, j.court, j.decision_date,
+                 j.holding.text, j.holding.provenance.value)
+            )
+            for ref in j.acts:
+                act_rows.append((j.uid, ref.key, ref.label, ref.section))
+
+        if rows:
+            with closing(self._conn.cursor()) as cur:
+                cur.executemany(
+                    "INSERT OR REPLACE INTO digest VALUES (?,?,?,?,?,?)", rows
+                )
+                if act_rows:
+                    cur.executemany(
+                        "INSERT OR REPLACE INTO digest_acts VALUES (?,?,?,?)", act_rows
+                    )
+            self._conn.commit()
+        return len(rows)
+
+    def consolidate_acts(self) -> int:
+        """Merge year-less act entries into their dated counterparts.
+
+        This has to run over the finished table, not per record: deciding that
+        "Indian Succession Act" means the 1925 Act requires seeing every year
+        the corpus ever pairs that name with. Done per record, a name would
+        stay split from its own dated form -- which is exactly what happened
+        before this pass existed, leaving the Code of Civil Procedure as two
+        separate entries of 7,883 and 3,789 judgments.
+
+        Names carrying more than one year (Companies Act 1956 and 2013) are
+        left alone: those are different statutes and merging them would pool
+        judgments under an enactment that was not applied.
+        """
+        from .acts import ActRef, resolve_years
+
+        rows = list(self._conn.execute(
+            "SELECT DISTINCT act_key, act_label FROM digest_acts"
+        ))
+        refs = []
+        for r in rows:
+            name, _, year = r["act_key"].rpartition("|")
+            refs.append(ActRef(name, int(year) if year else None, r["act_label"]))
+
+        resolution = resolve_years(refs)
+
+        updates = []
+        for ref in refs:
+            if ref.year is not None or ref.name not in resolution:
+                continue
+            year = resolution[ref.name]
+            target = f"{ref.name}|{year}"
+            label = next(
+                (x.label for x in refs if x.key == target), f"{ref.label}, {year}"
+            )
+            updates.append((target, label, ref.key))
+
+        if updates:
+            with closing(self._conn.cursor()) as cur:
+                # OR REPLACE: a judgment may already be indexed under the dated
+                # key, in which case the merge collapses the duplicate pair.
+                cur.executemany(
+                    "UPDATE OR REPLACE digest_acts SET act_key=?, act_label=? "
+                    "WHERE act_key=?",
+                    updates,
+                )
+            self._conn.commit()
+        return len(updates)
+
+    def digest_uids(self) -> set[str]:
+        """Ids already in the digest.
+
+        The weekly run uses this to avoid re-fetching a Supreme Court PDF it
+        has already read: the corpus grows, but what is already digested does
+        not change.
+        """
+        return {r[0] for r in self._conn.execute("SELECT uid FROM digest")}
+
+    def act_index(self, since: str | None = None) -> list[sqlite3.Row]:
+        """Acts represented in the digest, most-litigated first."""
+        where = "WHERE d.date >= ?" if since else ""
+        params = (since,) if since else ()
+        return list(self._conn.execute(
+            f"""SELECT a.act_key, a.act_label, COUNT(DISTINCT a.uid) AS n
+                FROM digest_acts a JOIN digest d ON d.uid = a.uid
+                {where}
+                GROUP BY a.act_key, a.act_label
+                ORDER BY n DESC, a.act_label""",
+            params,
+        ))
+
+    def by_act(
+        self, act_key: str, since: str | None = None, limit: int | None = None
+    ) -> list[sqlite3.Row]:
+        """Judgments decided under one act."""
+        sql = """SELECT d.name, d.court, d.date, d.held, d.held_source, a.section
+                 FROM digest d JOIN digest_acts a ON d.uid = a.uid
+                 WHERE a.act_key = ?"""
+        params: list[object] = [act_key]
+        if since:
+            sql += " AND d.date >= ?"
+            params.append(since)
+        sql += " ORDER BY d.date DESC"
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        return list(self._conn.execute(sql, params))
+
+    def digest_counts(self) -> dict[str, int]:
+        row = self._conn.execute(
+            """SELECT COUNT(*) AS n,
+                      SUM(held_source='headnote') AS with_held,
+                      (SELECT COUNT(DISTINCT act_key) FROM digest_acts) AS acts
+               FROM digest"""
+        ).fetchone()
+        return {
+            "judgments": row["n"] or 0,
+            "with_holding": row["with_held"] or 0,
+            "acts": row["acts"] or 0,
+        }
 
     def counts(self, court: str | None = None) -> Counts:
         where, params = ("WHERE court = ?", (court,)) if court else ("", ())

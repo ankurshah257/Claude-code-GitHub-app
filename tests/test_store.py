@@ -104,5 +104,104 @@ class TestStore(unittest.TestCase):
             self.assertIn("judicial_section", row["signals"])
 
 
+
+class TestDigest(unittest.TestCase):
+    """The lean act-wise database: name, court, date, held."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "d.db"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def _judgment(self, uid, acts, section="Civil", held=""):
+        from judgments.acts import canonical
+        from judgments.holding import Holding, Provenance
+        from dataclasses import replace
+        j = make(uid, section)
+        refs = [canonical(a) for a in acts]
+        return replace(
+            j,
+            acts=[r for r in refs if r],
+            holding=Holding(held, Provenance.HEADNOTE if held else Provenance.NONE),
+        )
+
+    def test_only_civil_enters_the_digest(self):
+        with Store(self.path) as s:
+            s.add_digest([
+                self._judgment("civil:1", ["Companies Act 2013"]),
+                self._judgment("crim:1", ["Companies Act 2013"], section="Criminal"),
+            ])
+            self.assertEqual(s.digest_counts()["judgments"], 1)
+
+    def test_act_index_counts_judgments(self):
+        with Store(self.path) as s:
+            s.add_digest([
+                self._judgment("a:1", ["Companies Act 2013"]),
+                self._judgment("b:1", ["Companies Act 2013"]),
+                self._judgment("c:1", ["Indian Succession Act, 1925"]),
+            ])
+            index = {r["act_label"]: r["n"] for r in s.act_index()}
+            self.assertEqual(index["Companies Act, 2013"], 2)
+            self.assertEqual(index["Indian Succession Act, 1925"], 1)
+
+    def test_one_judgment_can_sit_under_several_acts(self):
+        with Store(self.path) as s:
+            s.add_digest([self._judgment("a:1", ["Companies Act 2013", "Constitution of India"])])
+            self.assertEqual(len(s.act_index()), 2)
+
+    def test_consolidate_merges_yearless_into_dated(self):
+        with Store(self.path) as s:
+            s.add_digest([
+                self._judgment("a:1", ["Indian Succession Act, 1925"]),
+                self._judgment("b:1", ["Indian Succession Act"]),
+            ])
+            self.assertEqual(len(s.act_index()), 2)   # split before
+            s.consolidate_acts()
+            index = s.act_index()
+            self.assertEqual(len(index), 1)           # merged after
+            self.assertEqual(index[0]["n"], 2)
+
+    def test_consolidate_leaves_ambiguous_names_split(self):
+        # Two years for one name: merging would misfile under a statute that
+        # was not applied.
+        with Store(self.path) as s:
+            s.add_digest([
+                self._judgment("a:1", ["Companies Act 1956"]),
+                self._judgment("b:1", ["Companies Act 2013"]),
+                self._judgment("c:1", ["Companies Act"]),
+            ])
+            s.consolidate_acts()
+            self.assertEqual(len(s.act_index()), 3)
+
+    def test_by_act_returns_the_four_requested_fields(self):
+        with Store(self.path) as s:
+            s.add_digest([self._judgment("a:1", ["Companies Act 2013"], held="X is held.")])
+            row = s.by_act("companies act|2013")[0]
+            self.assertEqual(row["name"], "A versus B")
+            self.assertEqual(row["court"], "Bombay High Court")
+            self.assertEqual(row["date"], "2024-05-01")
+            self.assertEqual(row["held"], "X is held.")
+            self.assertEqual(row["held_source"], "headnote")
+
+    def test_holding_provenance_is_recorded(self):
+        with Store(self.path) as s:
+            s.add_digest([self._judgment("a:1", ["Companies Act 2013"])])
+            self.assertEqual(s.by_act("companies act|2013")[0]["held_source"], "none")
+
+    def test_digest_is_idempotent(self):
+        with Store(self.path) as s:
+            for _ in range(3):
+                s.add_digest([self._judgment("a:1", ["Companies Act 2013"])])
+            self.assertEqual(s.digest_counts()["judgments"], 1)
+            self.assertEqual(len(s.act_index()), 1)
+
+    def test_since_filter(self):
+        with Store(self.path) as s:
+            s.add_digest([self._judgment("a:1", ["Companies Act 2013"])])
+            self.assertEqual(len(s.act_index(since="2020-01-01")), 1)
+            self.assertEqual(len(s.act_index(since="2030-01-01")), 0)
+
 if __name__ == "__main__":
     unittest.main()

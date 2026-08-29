@@ -1,0 +1,62 @@
+# Weekly refresh of the act-wise civil judgments digest.
+#
+# The run is incremental and idempotent: it re-reads the source exports (which
+# gain rows as judgments are published) and upserts on judgment id, so a repeat
+# run costs little and never duplicates. Supreme Court PDFs already digested
+# are not fetched again.
+name: Weekly judgments digest
+
+on:
+  schedule:
+    # 03:00 UTC Monday — 08:30 IST, after the week's publishing has settled.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "ISO start date"
+        default: "2026-01-01"
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    # A cold first run reads the whole 2026 corpus; later runs are far quicker.
+    timeout-minutes: 120
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # Restore last week's database so the run is incremental rather than
+      # rebuilding from scratch every time.
+      - name: Restore previous digest
+        uses: actions/cache@v4
+        with:
+          path: judgments.db
+          key: judgments-db-${{ github.run_id }}
+          restore-keys: judgments-db-
+
+      - name: Refresh digest
+        run: |
+          python -m judgments digest --since "${{ inputs.since || '2026-01-01' }}"
+
+      - name: Export act-wise snapshot
+        run: |
+          mkdir -p export
+          python -m judgments acts --limit 100000 > export/acts-index.txt
+          python -m judgments stats >> export/acts-index.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: judgments-digest
+          path: |
+            judgments.db
+            export/acts-index.txt
+          retention-days: 90

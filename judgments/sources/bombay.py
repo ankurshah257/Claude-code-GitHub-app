@@ -15,7 +15,9 @@ from typing import Iterator
 
 import pandas as pd
 
+from ..acts import ActRef, parse as parse_acts
 from ..classify import Classification, classify_high_court
+from ..holding import Holding, Provenance
 from ..taxonomy import BOMBAY_BENCHES, BOMBAY_COURT_CODE
 from . import s3
 
@@ -65,7 +67,33 @@ class Judgment:
     judge: str = ""
     disposal: str = ""
     url: str = ""
+    #: Statutes the matter turns on, canonicalised. Empty when the source does
+    #: not record them.
+    acts: list[ActRef] = field(default_factory=list)
+    #: What the judgment held, with its provenance. Empty for courts that
+    #: publish no headnotes.
+    holding: Holding = field(default_factory=lambda: Holding("", Provenance.NONE))
     extra: dict[str, str] = field(default_factory=dict)
+
+
+def _today() -> str:
+    from datetime import date as _date
+
+    return _date.today().isoformat()
+
+
+def to_iso(date: str) -> str:
+    """Normalise a corpus date to ISO ``YYYY-MM-DD``.
+
+    The two exports disagree: the High Court writes ``YYYY-MM-DD`` and the
+    Supreme Court writes ``DD-MM-YYYY``. Storing both verbatim would put mixed
+    formats in one column, where a string comparison silently excludes every
+    Supreme Court judgment from a date window.
+    """
+    text = (date or "").strip()[:10]
+    if len(text) == 10 and text[2] == "-" and text[5] == "-":
+        return f"{text[6:]}-{text[3:5]}-{text[:2]}"
+    return text
 
 
 def _text(value: object) -> str:
@@ -153,3 +181,111 @@ def scan_year(year: str, mobile: bool = True) -> Iterator[Judgment]:
     """Yield every Bombay judgment for one year across all benches."""
     for bench in available_benches(year):
         yield from scan_bench(year, bench, mobile=mobile)
+
+
+# --------------------------------------------------------------------------
+# Case-level scan
+#
+# The metadata partition above is order-level: one row per order, several per
+# case. For a database *of judgments* that is the wrong grain — it would list
+# the same matter a dozen times as it moved through the court.
+#
+# The case-details export is one row per case, and it is also the only place
+# the registry records which Acts a matter turns on. So act-wise work reads
+# this instead. It is not year-partitioned, so callers filter by decision date.
+# --------------------------------------------------------------------------
+
+CASE_COLUMNS = [
+    "cnr",
+    "case_type",
+    "case_no",
+    "judicial_section",
+    "date_of_decision",
+    "petitioner",
+    "respondent",
+    "judge",
+    "bench_name",
+    "disposal_nature",
+    "acts",
+]
+
+
+def _case_details_key(bench: str) -> str:
+    return (
+        f"metadata/parquet_case_details/court={BOMBAY_COURT_CODE}/"
+        f"bench={bench}/case_details-mobile.parquet"
+    )
+
+
+def case_detail_benches() -> list[str]:
+    """Benches for which a case-details export exists."""
+    return s3.list_partition_values(
+        s3.HIGH_COURT_BUCKET,
+        f"metadata/parquet_case_details/court={BOMBAY_COURT_CODE}/",
+        "bench",
+    )
+
+
+def scan_cases(bench: str, since: str | None = None) -> Iterator[Judgment]:
+    """Yield one classified record per *case* for a bench.
+
+    ``since`` is an ISO date; only judgments decided on or after it are yielded.
+    """
+    try:
+        blob = s3.fetch(s3.HIGH_COURT_BUCKET, _case_details_key(bench))
+    except s3.S3Error:
+        return
+
+    frame = pd.read_parquet(io.BytesIO(blob))
+    present = [c for c in CASE_COLUMNS if c in frame.columns]
+
+    for row in frame[present].itertuples(index=False):
+        record = dict(zip(present, row))
+
+        decided = _text(record.get("date_of_decision"))[:10]
+        # An undecided matter is pending, not a judgment.
+        if not decided or (since and decided < since):
+            continue
+        # A handful of rows carry a decision date in the future, which is a
+        # registry data-entry error. Admitting them puts judgments that have
+        # not happened at the top of every date-sorted list.
+        if decided > _today():
+            continue
+
+        uid = _text(record.get("cnr"))
+        if not uid:
+            continue
+
+        petitioner = _text(record.get("petitioner"))
+        respondent = _text(record.get("respondent"))
+        name = f"{petitioner} v. {respondent}" if petitioner and respondent else (
+            petitioner or respondent or _text(record.get("case_no"))
+        )
+
+        yield Judgment(
+            uid=uid,
+            case_id=uid,
+            court="Bombay High Court",
+            bench=BOMBAY_BENCHES.get(bench, bench),
+            case_type=_text(record.get("case_type")),
+            case_no=_text(record.get("case_no")),
+            title=name,
+            decision_date=decided,
+            classification=classify_high_court(
+                judicial_section=record.get("judicial_section"),
+                case_type=record.get("case_type"),
+            ),
+            year=int(decided[:4]) if decided[:4].isdigit() else 0,
+            # Case-details rows carry a decision date, so each is a decided
+            # matter rather than an interim step.
+            is_final=True,
+            petitioner=petitioner,
+            respondent=respondent,
+            judge=_text(record.get("judge")),
+            disposal=_text(record.get("disposal_nature")),
+            acts=parse_acts(record.get("acts")),
+            # The Bombay High Court publishes no headnotes, so there is no
+            # authoritative statement of the holding to quote.
+            holding=Holding("", Provenance.NONE),
+            extra={"judicial_section": _text(record.get("judicial_section"))},
+        )

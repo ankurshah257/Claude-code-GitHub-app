@@ -17,6 +17,9 @@ from .sources import bombay, supreme
 from .sources.bombay import Judgment
 from .store import Store
 
+#: The digest starts here, per the brief.
+DEFAULT_SINCE = "2026-01-01"
+
 Progress = Callable[[str], None]
 
 
@@ -123,3 +126,70 @@ def scan_supreme(
         progress(f"  {key}: {rows} judgments")
 
     return ScanResult(partitions, written, skipped)
+
+
+# --------------------------------------------------------------------------
+# The weekly digest build
+# --------------------------------------------------------------------------
+
+
+def build_digest(
+    store: Store,
+    since: str = DEFAULT_SINCE,
+    *,
+    courts: tuple[str, ...] = ("bombay", "supreme"),
+    workers: int = 8,
+    progress: Progress = _noop,
+) -> dict[str, int]:
+    """Bring the act-wise civil digest up to date.
+
+    Designed to be re-run on a schedule. Partition resume is deliberately *not*
+    used: the source exports are living files that gain rows as judgments are
+    published, so skipping a bench because it was seen last week would mean
+    never seeing anything new. Instead every write is an upsert keyed on the
+    judgment id, which makes a repeat run cheap and idempotent rather than
+    duplicative.
+    """
+    added = {"bombay": 0, "supreme": 0}
+
+    if "bombay" in courts:
+        for bench in bombay.case_detail_benches():
+            count = 0
+            for batch in _batched(bombay.scan_cases(bench, since=since), 2000):
+                store.add(batch)
+                count += store.add_digest(batch)
+            added["bombay"] += count
+            progress(f"  bombay/{bench}: {count} civil judgments")
+
+    if "supreme" in courts:
+        # Only years the window can touch.
+        start_year = int(since[:4])
+        years = [y for y in supreme.available_years() if int(y) >= start_year]
+
+        # Reading a Supreme Court judgment costs a PDF fetch, so skip the ones
+        # already digested rather than paying for them again every week.
+        seen = store.digest_uids()
+
+        for year in years:
+            fresh = [
+                j for j in supreme.scan_year(year)
+                if j.uid not in seen and j.decision_date and j.decision_date >= since
+            ]
+            if not fresh:
+                progress(f"  supreme/{year}: nothing new")
+                continue
+
+            count = 0
+            for batch in _batched(iter(fresh), 100):
+                done = list(supreme.classify_all(batch, workers=workers))
+                store.add(done)
+                count += store.add_digest(done)
+                progress(f"  supreme/{year}: {count} civil judgments so far...")
+            added["supreme"] += count
+            progress(f"  supreme/{year}: {count} civil judgments")
+
+    merged = store.consolidate_acts()
+    if merged:
+        progress(f"  consolidated {merged} year-less act entries")
+
+    return added

@@ -24,8 +24,10 @@ from typing import Iterable, Iterator
 
 import pandas as pd
 
+from ..acts import canonical
 from ..classify import Classification, Outcome, classify_supreme_court
-from .bombay import Judgment, _text
+from ..holding import Holding, Provenance, extract_acts, extract_held
+from .bombay import Judgment, _text, to_iso
 from . import s3
 
 #: Pages read per judgment. The jurisdiction header and case designation sit in
@@ -72,7 +74,7 @@ def scan_year(year: str) -> Iterator[Judgment]:
             case_type="",
             case_no=_text(record.get("citation")),
             title=_text(record.get("title")),
-            decision_date=_text(record.get("decision_date"))[:10],
+            decision_date=to_iso(_text(record.get("decision_date"))),
             # Nothing has been read yet, so the honest state is UNKNOWN rather
             # than a default that a caller might mistake for a finding.
             classification=Classification(
@@ -137,7 +139,22 @@ def classify_one(judgment: Judgment) -> Judgment:
                 Outcome.UNKNOWN, 0.0, [], f"Could not read PDF: {err}"
             ),
         )
-    return replace(judgment, classification=classify_supreme_court(text))
+
+    # One fetch, three answers: the PDF is expensive to get, so the
+    # classification, the holding and the statutes are all taken from it here
+    # rather than by reading it again later.
+    refs = []
+    for name in extract_acts(text):
+        ref = canonical(name)
+        if ref is not None:
+            refs.append(ref)
+
+    return replace(
+        judgment,
+        classification=classify_supreme_court(text),
+        holding=extract_held(text),
+        acts=refs,
+    )
 
 
 def classify_all(

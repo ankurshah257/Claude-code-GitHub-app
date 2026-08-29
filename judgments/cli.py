@@ -120,6 +120,65 @@ def cmd_civil(args: argparse.Namespace) -> None:
             print("No civil judgments matched.")
 
 
+def cmd_digest(args: argparse.Namespace) -> None:
+    """Build or refresh the act-wise civil digest. This is the weekly job."""
+    say = (lambda m: None) if args.quiet else (lambda m: print(m, flush=True))
+    from .scan import build_digest
+
+    courts = ("bombay", "supreme") if args.court == "both" else (args.court,)
+    with Store(args.db) as store:
+        say(f"Building digest from {args.since} for: {', '.join(courts)}")
+        added = build_digest(
+            store, since=args.since, courts=courts,
+            workers=args.workers, progress=say,
+        )
+        counts = store.digest_counts()
+        say(f"\nAdded this run: {added}")
+        print(
+            f"Digest: {counts['judgments']:,} civil judgments, "
+            f"{counts['acts']:,} distinct acts, "
+            f"{counts['with_holding']:,} with a verbatim holding."
+        )
+
+
+def cmd_acts(args: argparse.Namespace) -> None:
+    """Browse the digest act-wise."""
+    with Store(args.db) as store:
+        if not args.act:
+            rows = store.act_index(since=args.since)
+            if not rows:
+                sys.exit("Digest is empty. Run: python -m judgments digest")
+            print(f"{'judgments':>9}  act")
+            for r in rows[: args.limit]:
+                print(f"{r['n']:>9,}  {r['act_label']}")
+            print(f"\n{len(rows):,} acts. Use --act \"<name>\" to list judgments.")
+            return
+
+        # Match on the display label so a user can pass what they just read.
+        matches = [
+            r for r in store.act_index(since=args.since)
+            if args.act.lower() in r["act_label"].lower()
+        ]
+        if not matches:
+            sys.exit(f"No act matching {args.act!r}.")
+        if len(matches) > 1 and not args.exact:
+            print("Several acts match; narrow with a fuller name:")
+            for r in matches[:10]:
+                print(f"  {r['n']:>7,}  {r['act_label']}")
+            return
+
+        target = matches[0]
+        print(f"=== {target['act_label']} ({target['n']:,} judgments) ===\n")
+        for r in store.by_act(target["act_key"], since=args.since, limit=args.limit):
+            section = f" [s. {r['section']}]" if r["section"] else ""
+            print(f"{r['date']}  {r['court']}{section}")
+            print(f"  {r['name'][:100]}")
+            if r["held"]:
+                mark = "held" if r["held_source"] == "headnote" else "summary"
+                print(f"  {mark}: {r['held'][:280]}")
+            print()
+
+
 def cmd_review(args: argparse.Namespace) -> None:
     """Show what the system refused to classify."""
     with Store(args.db) as store:
@@ -164,6 +223,22 @@ def main(argv: list[str] | None = None) -> None:
     civil.add_argument("--limit", type=int, default=50)
     civil.add_argument("--csv", action="store_true")
     civil.set_defaults(func=cmd_civil)
+
+    digest = sub.add_parser(
+        "digest", help="build/refresh the act-wise civil digest (the weekly job)"
+    )
+    digest.add_argument("--since", default="2026-01-01", help="ISO start date")
+    digest.add_argument("--court", choices=["both", "bombay", "supreme"], default="both")
+    digest.add_argument("--workers", type=int, default=8)
+    digest.add_argument("--quiet", action="store_true")
+    digest.set_defaults(func=cmd_digest)
+
+    acts = sub.add_parser("acts", help="browse the digest act-wise")
+    acts.add_argument("--act", help="show judgments under this act")
+    acts.add_argument("--since", help="ISO start date")
+    acts.add_argument("--exact", action="store_true", help="take the first match")
+    acts.add_argument("--limit", type=int, default=40)
+    acts.set_defaults(func=cmd_acts)
 
     review = sub.add_parser("review", help="show judgments the system declined to classify")
     review.add_argument("--limit", type=int, default=50)
