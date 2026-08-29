@@ -1,0 +1,5 @@
+# Bombay High Court path (Parquet metadata)
+pandas>=2.0
+pyarrow>=15.0
+# Supreme Court path only: per-judgment PDF text extraction
+pypdf>=4.0

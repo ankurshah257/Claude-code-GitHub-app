@@ -4,3 +4,11 @@ dist/
 .env
 .env.*
 !.env.example
+
+# Python scanner
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+*.parquet
