@@ -227,7 +227,11 @@ def generate_holdings(
 
         model = DEFAULT_MODEL
 
-    pending = store.needing_holdings("Bombay High Court", limit=limit)
+    # No limit on the query: the limit must be applied *after* filtering to
+    # judgments whose text can actually be retrieved. Only about 6% of pending
+    # rows have a document, so capping the query first means a small run draws
+    # 20 rows of which ~1 is reachable -- and a real run drew zero.
+    pending = store.needing_holdings("Bombay High Court")
     if not pending:
         return {"summarised": 0, "no_holding": 0, "failed": 0, "unavailable": 0,
                 "usage": Usage(), "model": model}
@@ -239,6 +243,13 @@ def generate_holdings(
     # paying for a fetch that turns out to have nothing to read.
     reachable = [r for r in pending if r["uid"] in index]
     from_kanoon = [r for r in pending if r["uid"] not in index] if kanoon_token else []
+
+    # Apply the cap to work that can actually happen, preferring the open
+    # corpus (free to fetch) before Indian Kanoon (billed per call).
+    if limit:
+        reachable = reachable[:limit]
+        from_kanoon = from_kanoon[: max(0, limit - len(reachable))]
+
     unavailable = len(pending) - len(reachable) - len(from_kanoon)
     progress(
         f"  {len(reachable):,} of {len(pending):,} have a judgment PDF in the open corpus"

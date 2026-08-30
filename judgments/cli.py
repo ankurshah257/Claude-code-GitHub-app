@@ -194,7 +194,9 @@ def cmd_summarize(args: argparse.Namespace) -> None:
     say = (lambda m: None) if args.quiet else (lambda m: print(m, flush=True))
 
     with Store(args.db) as store:
-        pending = store.needing_holdings("Bombay High Court", limit=args.limit)
+        # Unlimited query: the cap is applied after the reachability filter,
+        # since most pending rows have no retrievable document.
+        pending = store.needing_holdings("Bombay High Court")
         if not pending:
             print("Every Bombay judgment in the digest already has a holding.")
             return
@@ -209,10 +211,13 @@ def cmd_summarize(args: argparse.Namespace) -> None:
         missing = len(pending) - len(reachable)
 
         token = args.kanoon_token or os.environ.get("INDIANKANOON_TOKEN", "")
-        n = len(reachable) + (missing if token else 0)
+        available = len(reachable) + (missing if token else 0)
+        n = min(available, args.limit) if args.limit else available
 
         print(f"{len(pending):,} judgments lack a holding; "
               f"{len(reachable):,} have a PDF in the open corpus.")
+        if args.limit:
+            print(f"This run is capped at {args.limit:,}.")
         if token:
             print(f"{missing:,} will be looked up on Indian Kanoon "
                   f"(their paid API bills ~2 calls each).")

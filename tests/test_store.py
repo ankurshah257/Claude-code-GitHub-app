@@ -256,5 +256,38 @@ class TestHoldingsPersistence(unittest.TestCase):
             self._seed(s)
             self.assertEqual(s.import_holdings([]), 0)
 
+
+class TestPendingSelection(unittest.TestCase):
+    """The holdings cap must be applied after reachability, not before."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "q.db"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_unlimited_query_returns_every_pending_row(self):
+        # generate_holdings needs the full set so it can filter to judgments
+        # whose text is retrievable and only then apply the cap. Capping the
+        # query first made a --limit 20 run draw 20 rows of which none had a
+        # document, and summarise nothing.
+        with Store(self.path) as s:
+            for i in range(30):
+                s.add_digest([make(f"u{i}:1")])
+            self.assertEqual(len(s.needing_holdings("Bombay High Court")), 30)
+            self.assertEqual(len(s.needing_holdings("Bombay High Court", limit=5)), 5)
+
+    def test_pending_excludes_rows_that_already_have_a_holding(self):
+        from dataclasses import replace
+        from judgments.holding import Holding, Provenance
+        with Store(self.path) as s:
+            s.add_digest([make("done:1")])
+            s.add_digest([replace(make("todo:1"),
+                                  holding=Holding("", Provenance.NONE))])
+            s.set_holding("done:1", "Already held.", "generated")
+            uids = {r["uid"] for r in s.needing_holdings("Bombay High Court")}
+            self.assertEqual(uids, {"todo:1"})
+
 if __name__ == "__main__":
     unittest.main()
