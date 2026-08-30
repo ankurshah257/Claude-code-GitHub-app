@@ -12,7 +12,7 @@ date, and what was held** — indexed by the Act it turns on, from 1 January 202
 ```bash
 pip install -r requirements.txt
 
-python -m judgments digest --since 2026-01-01   # build / refresh (the weekly job)
+python -m judgments digest --since 2026-01-01   # build / refresh the digest
 python -m judgments acts                        # act-wise index
 python -m judgments acts --act "Arbitration and Conciliation"
 ```
@@ -25,12 +25,16 @@ judgments  act
     1,882  Arbitration and Conciliation Act, 1996
 ```
 
-### Running it weekly
+### Running it on demand
 
-`.github/workflows/weekly-digest.yml` refreshes the digest every Monday and
-generates holdings for what is new. Re-running is cheap and idempotent: source
-exports gain rows as judgments are published, so the job re-reads and upserts on
-judgment id, and documents already read are never fetched twice.
+`.github/workflows/weekly-digest.yml` refreshes the digest and generates
+holdings for what is new. **It runs only when you start it** — Actions → *Judgments
+digest (manual)* → *Run workflow*. There is deliberately no schedule: the
+summarise step spends real money, and nothing here should spend it unattended.
+
+Re-running is cheap and idempotent: source exports gain rows as judgments are
+published, so the job re-reads and upserts on judgment id, and documents already
+read are never fetched twice.
 
 Add two repository secrets:
 
@@ -39,21 +43,25 @@ Add two repository secrets:
 | `ANTHROPIC_API_KEY` | generating holdings — without it the job still builds the digest and skips summarising |
 | `INDIANKANOON_TOKEN` | judgments missing from the open corpus |
 
-Two rules keep an unattended job from spending unexpectedly:
+Two rules bound what any single run can spend:
 
-- **A scheduled run is capped** at `SCHEDULED_LIMIT` (500, about $16 a week),
-  which keeps pace with new judgments. The 40k backfill costs over a thousand
-  dollars and a cron cannot start it — run it by hand via *Run workflow* with an
-  explicit `summarize_limit`.
-- **A scheduled run never bills Indian Kanoon.** Their lookup is opt-in per run
-  (`use_kanoon`), so the weekly job stays on the free corpus unless you ask.
+- **Every run is capped** by `summarize_limit` (default 500, about $16). The
+  40k backfill costs over a thousand dollars, so it only happens if you type a
+  limit that large.
+- **Indian Kanoon is opt-in per run** (`use_kanoon`). Leave it unticked and the
+  run stays on the free open corpus, billing them nothing.
 
 **Holdings are committed to `data/holdings.csv`.** The digest can be rebuilt
 from the open corpus for nothing, but holdings cannot — so they are restored
 into the database *before* each summarise step. A cache eviction then costs
 rebuild time instead of silently re-buying work already paid for. The file is
-plain text sorted by id, so git delta-compresses it and a weekly run adds
+plain text sorted by id, so git delta-compresses it and a run adds
 kilobytes.
+
+The cap is applied *after* filtering to judgments whose text can actually be
+retrieved. Applied before, a `--limit 20` run sampled 20 rows of which ~6% were
+reachable and summarised nothing — which is exactly what the first real run
+did.
 
 ### What "held" means, and when it is missing
 

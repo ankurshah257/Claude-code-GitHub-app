@@ -1,23 +1,18 @@
-# Weekly refresh of the act-wise civil judgments digest, and generation of
-# holdings for the judgments that have none.
+# Refresh of the act-wise civil judgments digest, and generation of holdings
+# for the judgments that have none.
 #
-# Two cost rules shape this file, because the summarise step spends real money
-# unattended:
+# MANUAL ONLY. There is deliberately no `schedule:` trigger — this job spends
+# real money on the summarise step, and it runs only when someone starts it.
+# Re-adding a cron here would restore unattended spending, so don't do it
+# without deciding that is what you want.
 #
-#   1. A scheduled run is capped (SCHEDULED_LIMIT). The weekly delta is a few
-#      hundred judgments; the 40k backfill costs over a thousand dollars and is
-#      deliberately not something a cron can start on its own. Run it by hand
-#      with workflow_dispatch and an explicit limit.
-#   2. Holdings are committed to the repository as CSV. The digest is free to
-#      rebuild from the open corpus, but holdings are not, so they must survive
-#      a cache eviction — otherwise a cache miss silently re-buys work already
-#      paid for.
-name: Weekly judgments digest
+# Holdings are committed to the repository as CSV. The digest is free to
+# rebuild from the open corpus, but holdings are not, so they must survive a
+# cache eviction — otherwise a cache miss silently re-buys work already paid
+# for.
+name: Judgments digest (manual)
 
 on:
-  schedule:
-    # 03:00 UTC Monday — 08:30 IST, after the week's publishing has settled.
-    - cron: "0 3 * * 1"
   workflow_dispatch:
     inputs:
       since:
@@ -27,15 +22,14 @@ on:
         description: "Max judgments to summarise this run (0 = skip summarising)"
         default: "500"
       use_kanoon:
-        description: "Also source judgments missing from the open corpus from Indian Kanoon"
+        description: "Also source judgments missing from the open corpus from Indian Kanoon (their paid API)"
         type: boolean
         default: false
 
 env:
-  # Weekly ceiling for a scheduled run. At ~$0.0325 a judgment this is about
-  # $16 a week, which keeps pace with new judgments without ever surprising
-  # anyone with a large bill.
-  SCHEDULED_LIMIT: "500"
+  # Fallback ceiling if a run is started without naming one. At ~$0.0325 a
+  # judgment this is about $16.
+  DEFAULT_LIMIT: "500"
 
 jobs:
   digest:
@@ -77,7 +71,7 @@ jobs:
           HAS_ANTHROPIC: ${{ secrets.ANTHROPIC_API_KEY != '' }}
           HAS_KANOON: ${{ secrets.INDIANKANOON_TOKEN != '' }}
         run: |
-          LIMIT="${{ inputs.summarize_limit || env.SCHEDULED_LIMIT }}"
+          LIMIT="${{ inputs.summarize_limit || env.DEFAULT_LIMIT }}"
           if [ "$HAS_ANTHROPIC" != "true" ]; then
             echo "No ANTHROPIC_API_KEY secret; skipping summarisation."
             LIMIT=0
@@ -106,7 +100,7 @@ jobs:
           python -m judgments stats >> export/acts-index.txt
 
       # Committed as plain text, sorted by id: git delta-compresses it well, so
-      # after the first commit a weekly run adds kilobytes rather than megabytes.
+      # after the first commit a run adds kilobytes rather than megabytes.
       - name: Commit holdings
         run: |
           git config user.name "github-actions[bot]"
